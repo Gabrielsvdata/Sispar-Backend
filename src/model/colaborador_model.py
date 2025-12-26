@@ -14,16 +14,18 @@ class Colaborador(db.Model):
     senha = Column(String(255))
     cargo = Column(String(100))
     salario = Column(DECIMAL(10,2))
+    tipo = Column(String(20), default='usuario')
 
 
 #------------------------------------------------------------------
 
-    def __init__(self, nome, email, senha, cargo, salario):
+    def __init__(self, nome, email, senha, cargo, salario, tipo='usuario'):
         self.nome = nome
         self.email = email
         self.senha = senha
         self.cargo = cargo
         self.salario = salario
+        self.tipo = tipo
 
     def to_dict(self) -> dict:
             return {
@@ -31,7 +33,8 @@ class Colaborador(db.Model):
                 'nome': self.nome,
                 'email': self.email,
                 'cargo': self.cargo,
-                'senha': self.senha
+                'senha': self.senha,
+                'tipo': self.tipo
             }
     
     def all_data(self) -> dict:
@@ -40,5 +43,6 @@ class Colaborador(db.Model):
             'nome': self.nome,
             'cargo': self.cargo,
             'salario': self.salario,
-            'email':self.email
+            'email': self.email,
+            'tipo': self.tipo
         }

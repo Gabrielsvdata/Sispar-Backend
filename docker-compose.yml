@@ -14,7 +14,7 @@ services:
       - .env
     depends_on:
       - sispar-db
-    command: /bin/sh -c "sleep 20 && flask run --host=0.0.0.0 --reload"
+    command: /bin/sh -c "sleep 20 && python run.py"
 
   sispar-db:
     image: mysql:8.0

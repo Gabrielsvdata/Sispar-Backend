@@ -24,9 +24,14 @@ def cadastrar_novo_colaborador():
     nome = dados.get('nome')
     email = dados.get('email')
     senha = dados.get('senha')
+    tipo = dados.get('tipo', 'usuario')  # Default: 'usuario'
 
     if not nome or not email or not senha:
         return jsonify({'mensagem': 'Nome, email e senha são obrigatórios.'}), 400
+    
+    # Validação do campo 'tipo'
+    if tipo not in ['usuario', 'admin']:
+        return jsonify({'mensagem': "O campo 'tipo' deve ser 'usuario' ou 'admin'."}), 400
 
     try:
         novo = Colaborador(
@@ -34,7 +39,8 @@ def cadastrar_novo_colaborador():
             email=email,
             senha=hash_senha(senha),
             cargo=dados.get('cargo'),
-            salario=dados.get('salario')
+            salario=dados.get('salario'),
+            tipo=tipo
         )
         db.session.add(novo)
         db.session.commit()
@@ -144,7 +150,8 @@ def login():
         dados_do_usuario_para_retorno = {
             'id': colaborador.get('id'),
             'nome': colaborador.get('nome'),
-            'cargo': colaborador.get('cargo')
+            'cargo': colaborador.get('cargo'),
+            'tipo': colaborador.get('tipo')
         }
         return jsonify({
             'mensagem': 'Login realizado com sucesso',
