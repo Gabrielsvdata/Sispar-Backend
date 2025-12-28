@@ -152,7 +152,7 @@ def remover_reembolso(num_prestacao):
         if not r:
             return jsonify({'erro': 'Reembolso não encontrado.'}), 404
         
-        # DELETAR COMPROVANTES ASSOCIADOS PRIMEIRO
+        # COMPROVANTES ASSOCIADOS PRIMEIRO
         comprovantes = Comprovante.query.filter_by(reembolso_id=num_prestacao).all()
         base_dir = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))  # /app
         for comp in comprovantes:

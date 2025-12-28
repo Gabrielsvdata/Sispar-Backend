@@ -5,7 +5,7 @@ from src.controler.ocr_controller import ocr_bp
 from src.controler.chatbot_controller import bp_chatbot
 from src.controler.analise_ia_controller import bp_analise_ia
 from src.model import db
-from config import Config
+from config import get_config
 from flask_cors import CORS
 from flasgger import Swagger, LazyJSONEncoder
 import os
@@ -51,8 +51,8 @@ swagger_config = {
 def create_app():
     app = Flask(__name__)
 
-    # 1) Carrega as configurações
-    app.config.from_object(Config)
+    # 1) Carrega as configurações baseado no ambiente (FLASK_ENV)
+    app.config.from_object(get_config())
 
     # 2) Inicializa extensões
     db.init_app(app)
@@ -63,7 +63,8 @@ def create_app():
                 "http://localhost:3000", 
                 "http://localhost:5000",
                 "https://sispar-sign.vercel.app",
-                "https://sispar-sign-git-main-gabrielsvdata.vercel.app"
+                "https://sispar-sign-git-main-gabrielsvdata.vercel.app",
+                "https://projeto-sispar.vercel.app"
             ],
             "methods": ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
             "allow_headers": ["Content-Type", "Authorization"],
