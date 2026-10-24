@@ -198,6 +198,7 @@ def test_analise_usa_dados_da_ia_e_calcula_divergencia_em_python(client, monkeyp
     assert dados["fonte_leitura"] == "ia"
     assert dados["validacoes"]["valor_corresponde"] is False
     assert dados["validacoes"]["divergencia_percentual"] == 20.5
+    assert dados["validacoes"]["estabelecimento_valido"] is False  # IA não leu razão social nem CNPJ
     assert dados["aprovacao_sugerida"] is False
 
 

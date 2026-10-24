@@ -207,6 +207,8 @@ def montar_analise(dados_ia, reembolso, comprovante):
         "data_valida": data_valida,
         "data_comprovante": dados_extraidos["data_emissao"],
         "tipo_despesa_correto": categoria_compativel(categoria, reembolso.tipo_reembolso),
+        # Sem leitura por IA não há como identificar o estabelecimento; não marca como inválido
+        "estabelecimento_valido": bool(dados_ia.get("razao_social") or dados_ia.get("cnpj")) if dados_ia else True,
         "tipo_detectado": categoria,
         "comprovante_legivel": bool(dados_ia.get("comprovante_legivel", bool(valor_lido))),
     }
