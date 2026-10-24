@@ -1,6 +1,7 @@
 from src.model import db
 from datetime import datetime
-from sqlalchemy import Column, Integer, String, Text, DateTime, ForeignKey, DECIMAL
+from sqlalchemy import Column, Integer, String, Text, DateTime, ForeignKey, DECIMAL, LargeBinary
+from sqlalchemy.orm import deferred
 
 class Comprovante(db.Model):
     __tablename__ = "comprovantes"
@@ -18,10 +19,15 @@ class Comprovante(db.Model):
     # Campo para detecção de duplicatas (hash SHA-256 da imagem)
     hash_arquivo = Column(String(64), nullable=True, index=True)
     
+    # Arquivo original guardado no banco (servidores como Cloud Run apagam o disco a cada reinício).
+    # "deferred" evita carregar os bytes em listagens; só lê quando o arquivo é acessado.
+    arquivo = deferred(Column(LargeBinary, nullable=True))
+    mime_type = Column(String(100), nullable=True)
+
     # Relacionamento com reembolso
     reembolso_id = Column(Integer, ForeignKey('reembolso.num_prestacao'), nullable=False)
 
-    def __init__(self, nome_arquivo, texto_extraido, reembolso_id, valor_extraido=None, status_validacao='Pendente', discrepancia_percentual=None, hash_arquivo=None):
+    def __init__(self, nome_arquivo, texto_extraido, reembolso_id, valor_extraido=None, status_validacao='Pendente', discrepancia_percentual=None, hash_arquivo=None, arquivo=None, mime_type=None):
         self.nome_arquivo = nome_arquivo
         self.texto_extraido = texto_extraido
         self.reembolso_id = reembolso_id
@@ -29,6 +35,8 @@ class Comprovante(db.Model):
         self.status_validacao = status_validacao
         self.discrepancia_percentual = discrepancia_percentual
         self.hash_arquivo = hash_arquivo
+        self.arquivo = arquivo
+        self.mime_type = mime_type
 
     def to_dict(self):
         return {

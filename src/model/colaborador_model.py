@@ -10,7 +10,7 @@ class Colaborador(db.Model):
     id = Column(Integer, primary_key=True, autoincrement=True)
     # nome VARCHAR(100)
     nome = Column(String(100))
-    email = Column(String(100))
+    email = Column(String(100), unique=True)
     senha = Column(String(255))
     cargo = Column(String(100))
     salario = Column(DECIMAL(10,2))
@@ -33,7 +33,6 @@ class Colaborador(db.Model):
                 'nome': self.nome,
                 'email': self.email,
                 'cargo': self.cargo,
-                'senha': self.senha,
                 'tipo': self.tipo
             }
     
