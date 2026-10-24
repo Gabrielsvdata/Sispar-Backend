@@ -1,2 +1,9 @@
 .env
 .env.example
+
+# Gerados localmente
+__pycache__/
+*.pyc
+*.db
+temp/
+.pytest_cache/

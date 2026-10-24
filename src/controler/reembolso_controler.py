@@ -1,6 +1,7 @@
 from flasgger import swag_from
-from flask import Blueprint, request, jsonify
+from flask import Blueprint, request, jsonify, g
 from src.model import db
+from src.security.auth import login_obrigatorio, eh_admin, pode_acessar_reembolso, sem_permissao
 from src.model.reembolso_model import Reembolso
 from src.model.comprovante_model import Comprovante
 from src.utils.validacao_ocr import verificar_validacao_automatica
@@ -15,6 +16,7 @@ DOCS_BASE = os.path.join(os.path.dirname(__file__), '..', '..', 'docs', 'reembol
 # -------------------------------
 @bp_reembolso.route('/new', methods=['POST'])
 @swag_from(os.path.join(DOCS_BASE, 'cadastrar_reembolso.yml'))
+@login_obrigatorio()
 def criar_reembolso():
     try:
         d = request.get_json()
@@ -24,6 +26,10 @@ def criar_reembolso():
             return jsonify({'erro': 'Nenhum dado JSON recebido'}), 400
         
         # Validar campos obrigatórios
+        # O dono do reembolso é sempre o usuário logado (gestor pode lançar em nome de outro)
+        if not eh_admin() or not d.get('id_colaborador'):
+            d['id_colaborador'] = g.usuario_id
+
         campos_obrigatorios = ['colaborador', 'empresa', 'tipo_reembolso', 'centro_custo', 'valor_faturado', 'id_colaborador']
         campos_faltando = [campo for campo in campos_obrigatorios if campo not in d]
         
@@ -72,11 +78,16 @@ def criar_reembolso():
 # -------------------------------
 @bp_reembolso.route('/', methods=['GET'])
 @swag_from(os.path.join(DOCS_BASE, 'listar_reembolsos.yml'))
+@login_obrigatorio()
 def listar_reembolsos():
     try:
         status = request.args.get('status')
         num_prestacao = request.args.get('num_prestacao', type=int)
         colaborador_id = request.args.get('colaborador_id', type=int)
+
+        # Colaborador comum só enxerga os próprios reembolsos
+        if not eh_admin():
+            colaborador_id = g.usuario_id
 
         query = Reembolso.query
         if status:
@@ -93,12 +104,13 @@ def listar_reembolsos():
 
 
 @bp_reembolso.route('/<int:num_prestacao>', methods=['GET', 'OPTIONS'], strict_slashes=False)
+@login_obrigatorio()
 def buscar_reembolso(num_prestacao):
-    if request.method == 'OPTIONS':
-        return '', 200
     r = Reembolso.query.get(num_prestacao)
     if not r:
         return jsonify({'erro': 'Reembolso não encontrado.'}), 404
+    if not pode_acessar_reembolso(r):
+        return sem_permissao()
     return jsonify(r.to_dict()), 200
 
 
@@ -107,14 +119,19 @@ def buscar_reembolso(num_prestacao):
 # -------------------------------
 @bp_reembolso.route('/<int:num_prestacao>', methods=['PUT', 'OPTIONS'], strict_slashes=False)
 @swag_from(os.path.join(DOCS_BASE, 'atualizar_reembolso.yml'))
+@login_obrigatorio()
 def atualizar_reembolso(num_prestacao):
-    if request.method == 'OPTIONS':
-        return '', 200
     try:
-        dados = request.get_json()
+        dados = request.get_json() or {}
         r = Reembolso.query.get(num_prestacao)
         if not r:
             return jsonify({'erro': 'Reembolso não encontrado.'}), 404
+        if not pode_acessar_reembolso(r):
+            return sem_permissao()
+        # Status e dono só podem ser alterados por gestor
+        if not eh_admin():
+            dados.pop('status', None)
+            dados.pop('id_colaborador', None)
 
         novo_comprovante_id = dados.get('comprovante_id')
         if novo_comprovante_id:
@@ -144,27 +161,21 @@ def atualizar_reembolso(num_prestacao):
 # -------------------------------
 @bp_reembolso.route('/<int:num_prestacao>', methods=['DELETE', 'OPTIONS'], strict_slashes=False)
 @swag_from(os.path.join(DOCS_BASE, 'remover_reembolso.yml'))
+@login_obrigatorio()
 def remover_reembolso(num_prestacao):
-    if request.method == 'OPTIONS':
-        return '', 200
     try:
         r = Reembolso.query.get(num_prestacao)
         if not r:
             return jsonify({'erro': 'Reembolso não encontrado.'}), 404
+        if not pode_acessar_reembolso(r):
+            return sem_permissao()
         
         # COMPROVANTES ASSOCIADOS PRIMEIRO
+        # O arquivo fica na própria linha do comprovante, então sai junto
+        r.comprovante_id = None
+        db.session.flush()
         comprovantes = Comprovante.query.filter_by(reembolso_id=num_prestacao).all()
-        base_dir = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))  # /app
         for comp in comprovantes:
-            # Remover arquivo físico se existir
-            caminho_arquivo = os.path.join(base_dir, 'temp', comp.nome_arquivo)
-            if os.path.exists(caminho_arquivo):
-                try:
-                    os.remove(caminho_arquivo)
-                    print(f"DEBUG - Arquivo {comp.nome_arquivo} removido")
-                except Exception as e:
-                    print(f"AVISO - Erro ao remover arquivo {comp.nome_arquivo}: {e}")
-            
             db.session.delete(comp)
         
         # DELETAR ANÁLISES IA ASSOCIADAS (se existir)
@@ -191,9 +202,8 @@ def remover_reembolso(num_prestacao):
 # EXTRA - Ações de status
 # -------------------------------
 @bp_reembolso.route('/<int:num_prestacao>/aprovar', methods=['PATCH', 'OPTIONS'], strict_slashes=False)
+@login_obrigatorio('admin')
 def aprovar_reembolso(num_prestacao):
-    if request.method == 'OPTIONS':
-        return '', 200
     try:
         r = Reembolso.query.get(num_prestacao)
         if not r:
@@ -207,9 +217,8 @@ def aprovar_reembolso(num_prestacao):
 
 
 @bp_reembolso.route('/<int:num_prestacao>/rejeitar', methods=['PATCH', 'OPTIONS'], strict_slashes=False)
+@login_obrigatorio('admin')
 def rejeitar_reembolso(num_prestacao):
-    if request.method == 'OPTIONS':
-        return '', 200
     try:
         r = Reembolso.query.get(num_prestacao)
         if not r:
@@ -223,6 +232,7 @@ def rejeitar_reembolso(num_prestacao):
 
 
 @bp_reembolso.route('/<int:num_prestacao>/enviar-analise', methods=['PATCH'])
+@login_obrigatorio()
 def enviar_para_analise(num_prestacao):
     """
     Envia reembolso para análise com validação automática de OCR
@@ -231,6 +241,8 @@ def enviar_para_analise(num_prestacao):
         r = Reembolso.query.get(num_prestacao)
         if not r:
             return jsonify({'erro': 'Reembolso não encontrado.'}), 404
+        if not pode_acessar_reembolso(r):
+            return sem_permissao()
         
         # Busca o comprovante associado
         comprovante = None
@@ -263,6 +275,7 @@ def enviar_para_analise(num_prestacao):
 # NOVO - Análise automática com OCR
 # -------------------------------
 @bp_reembolso.route('/<int:num_prestacao>/analisar', methods=['POST'])
+@login_obrigatorio()
 def analisar_reembolso_ocr(num_prestacao):
     """
     Analisa reembolso automaticamente baseado no OCR do comprovante
@@ -272,6 +285,8 @@ def analisar_reembolso_ocr(num_prestacao):
         r = Reembolso.query.get(num_prestacao)
         if not r:
             return jsonify({'erro': 'Reembolso não encontrado.'}), 404
+        if not pode_acessar_reembolso(r):
+            return sem_permissao()
         
         # Busca o comprovante
         comprovante = None

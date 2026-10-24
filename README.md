@@ -5,7 +5,7 @@ Sistema de gerenciamento de reembolsos corporativos com inteligência artificial
 ![Python](https://img.shields.io/badge/Python-3.11-blue)
 ![Flask](https://img.shields.io/badge/Flask-3.1.0-green)
 ![PostgreSQL](https://img.shields.io/badge/PostgreSQL-15-blue)
-![Render](https://img.shields.io/badge/Deploy-Render-purple)
+![Cloud Run](https://img.shields.io/badge/Deploy-Cloud%20Run-blue)
 
 ---
 
@@ -15,7 +15,8 @@ Sistema de gerenciamento de reembolsos corporativos com inteligência artificial
 - [Arquitetura](#-arquitetura)
 - [Configuração de Ambientes](#-configuração-de-ambientes)
 - [Instalação Local](#-instalação-local)
-- [Deploy no Render](#-deploy-no-render)
+- [Deploy no Cloud Run](#-deploy-no-google-cloud-run)
+- [Autenticação e perfis](#-autenticação-e-perfis)
 - [Integração com IA](#-integração-com-ia)
 - [API Endpoints](#-api-endpoints)
 - [Variáveis de Ambiente](#-variáveis-de-ambiente)
@@ -27,7 +28,7 @@ Sistema de gerenciamento de reembolsos corporativos com inteligência artificial
 - ✅ **CRUD de Colaboradores** - Cadastro, autenticação e gestão
 - ✅ **Sistema de Reembolsos** - Solicitação, aprovação e acompanhamento
 - ✅ **OCR de Comprovantes** - Leitura automática de notas fiscais
-- ✅ **Chatbot com IA** - Assistente inteligente usando Groq/Gemini
+- ✅ **Chatbot com IA** - Assistente inteligente usando Groq
 - ✅ **Análise de IA** - Validação automática de comprovantes
 - ✅ **Documentação Swagger** - API documentada em `/apidocs`
 
@@ -58,7 +59,7 @@ Sispar-Backend/
 │   │   └── comprovante_model.py
 │   │
 │   ├── utils/             # Utilitários
-│   │   ├── ia_utils.py    # Integração com Groq/Gemini
+│   │   ├── ia_utils.py    # Score, duplicatas e histórico
 │   │   ├── ocr_reader.py  # Leitura de comprovantes
 │   │   └── validacao_ocr.py
 │   │
@@ -77,7 +78,7 @@ O projeto utiliza **3 ambientes** seguindo as melhores práticas da indústria:
 | Ambiente | Uso | Banco de Dados |
 |----------|-----|----------------|
 | **Development** | Sua máquina local | SQLite ou PostgreSQL local |
-| **Production** | Render (produção) | PostgreSQL na nuvem |
+| **Production** | Cloud Run (produção) | PostgreSQL na nuvem (Neon) |
 | **Testing** | Testes automatizados | SQLite em memória |
 
 ### Como funciona:
@@ -106,7 +107,7 @@ class ProductionConfig(Config):
 │     URL_DATABASE_DEV=sqlite         URL_DATABASE_PROD=postgres  │
 │            │                               │                    │
 │            ▼                               ▼                    │
-│      Banco Local                    Banco do Render             │
+│      Banco Local                    Banco na nuvem (Neon)       │
 │      (dados teste)                  (dados reais)               │
 │                                                                 │
 └─────────────────────────────────────────────────────────────────┘
@@ -154,32 +155,50 @@ http://localhost:5000/apidocs
 
 ---
 
-## 🚀 Deploy no Render
+## 🚀 Deploy no Google Cloud Run
 
-### Pré-requisitos no Render:
+A API roda num container (veja o `Dockerfile`): Tesseract para o OCR, Poppler para PDF e
+gunicorn escutando na porta da variável `PORT`. O banco é um Postgres gerenciado (ex.: Neon).
 
-1. **Crie um Web Service** conectado ao repositório GitHub
-2. **Crie um banco PostgreSQL** no Render
-
-### Variáveis de Ambiente no Render:
-
-| Variável | Valor | Descrição |
-|----------|-------|-----------|
-| `FLASK_ENV` | `production` | Define ambiente de produção |
-| `URL_DATABASE_PROD` | `postgresql://...` | URL do banco PostgreSQL |
-| `GROQ_API_KEY` | `gsk_xxx...` | Chave da API Groq |
-| `GEMINI_API_KEY` | `AIza...` | Chave da API Gemini |
-| `SECRET_KEY` | `sua-chave-secreta` | Chave para JWT/sessões |
-
-### Build Command:
 ```bash
-pip install -r requirements.txt
+gcloud run deploy sispar-api \
+  --source . \
+  --region southamerica-east1 \
+  --allow-unauthenticated \
+  --set-env-vars FLASK_ENV=production,DEMO_MODE=true,CORS_ORIGINS=https://sispar.pages.dev \
+  --set-secrets SECRET_KEY=sispar-secret-key:latest,DATABASE_URL=sispar-database-url:latest,GROQ_API_KEY=sispar-groq-key:latest
 ```
 
-### Start Command:
+Na primeira subida, as tabelas são criadas automaticamente e, com `DEMO_MODE=true`,
+os dados de demonstração também.
+
+### Rodando com Docker localmente
+
 ```bash
-gunicorn run:app
+docker compose up --build   # API em http://localhost:8080 com Postgres
 ```
+
+---
+
+## 🔑 Autenticação e perfis
+
+- `POST /colaborador/login` devolve um **token JWT** (validade padrão: 8 h).
+- Todas as rotas de reembolso, comprovante, análise e chatbot exigem `Authorization: Bearer <token>`.
+- **Colaborador** (`usuario`) vê e edita só os próprios reembolsos.
+- **Gestor** (`admin`) vê todos, aprova/rejeita, roda a análise com IA e consulta colaboradores.
+- O cadastro público cria só colaboradores; gestores são criados por outro gestor logado.
+
+### Modo demonstração
+
+Com `DEMO_MODE=true`, a API cria duas contas de visitante e alguns reembolsos fictícios
+(com comprovantes gerados na hora), e libera:
+
+```
+POST /colaborador/login-demo   {"perfil": "colaborador" | "gestor"}
+```
+
+As contas de demonstração não podem ter a senha trocada nem ser removidas.
+Para recriar os dados do zero: `python scripts/seed_demo.py --reset`.
 
 ---
 
@@ -208,32 +227,29 @@ GROQ_API_KEY=sua_chave_groq_aqui
 POST /chatbot/message
 ```
 
-### 2. Análise de Comprovantes (Gemini)
+### 2. Análise de Comprovantes (Groq Vision)
 
-Validação automática de notas fiscais e comprovantes usando visão computacional.
+A IA **só lê** o comprovante; as **validações e o score são calculados em Python**, com regras fixas.
+Assim o mesmo comprovante gera sempre o mesmo resultado.
 
-**Funcionalidades:**
-- ✅ Verifica se é uma nota fiscal válida
-- ✅ Extrai valor, data e estabelecimento
-- ✅ Detecta possíveis fraudes
-- ✅ Valida legibilidade do documento
+1. O modelo de visão do Groq extrai valor, data, CNPJ, itens e categoria do estabelecimento.
+2. O backend calcula a divergência entre valor declarado e valor lido, a validade da data,
+   a compatibilidade da categoria com o tipo de despesa e procura comprovantes duplicados (hash).
+3. O score de confiabilidade e a recomendação saem dessas regras.
 
-**Configuração:**
-```env
-GEMINI_API_KEY=sua_chave_gemini_aqui
-```
+Se a IA estiver indisponível, a análise usa o valor do OCR (Tesseract) e avisa isso no resultado
+(`fonte_leitura: "ocr"`).
 
 **Endpoint:**
 ```
-POST /analise-ia/analisar
+POST /reembolsos/{num_prestacao}/analisar-ia   (gestor)
 ```
 
-### Obtendo as Chaves de API:
+### Obtendo a chave de API
 
 | Serviço | Link | Uso |
 |---------|------|-----|
-| **Groq** | https://console.groq.com/ | Chatbot (LLaMA) |
-| **Gemini** | https://aistudio.google.com/apikey | Análise de imagens |
+| **Groq** | https://console.groq.com/keys | Chatbot (LLaMA 3.3) e leitura de comprovantes (Llama 4 Scout) |
 
 ---
 
@@ -277,32 +293,17 @@ POST /analise-ia/analisar
 
 ## 🔐 Variáveis de Ambiente
 
-### Arquivo `.env` (desenvolvimento local)
+| Variável | Obrigatória | Descrição |
+|----------|-------------|-----------|
+| `FLASK_ENV` | sim | `development`, `production` ou `testing` |
+| `SECRET_KEY` | em produção | Assina os tokens de login. Use um valor longo e aleatório |
+| `DATABASE_URL` | em produção | URL do Postgres (ex.: Neon, com `?sslmode=require`) |
+| `GROQ_API_KEY` | para IA | Chatbot e leitura de comprovantes |
+| `CORS_ORIGINS` | não | Origens extras do front, separadas por vírgula |
+| `DEMO_MODE` | não | `true` cria as contas de visitante e libera o login de demonstração |
+| `GROQ_CHAT_MODEL` / `GROQ_VISION_MODEL` | não | Troca os modelos usados |
 
-```env
-# Ambiente
-FLASK_ENV=development
-
-# Banco de dados local
-URL_DATABASE_DEV=sqlite:///dev.db
-
-# Chaves de API
-GROQ_API_KEY=sua_chave_groq
-GEMINI_API_KEY=sua_chave_gemini
-
-# Segurança
-SECRET_KEY=chave-secreta-desenvolvimento
-```
-
-### Render (produção)
-
-```env
-FLASK_ENV=production
-URL_DATABASE_PROD=postgresql://user:pass@host/database
-GROQ_API_KEY=sua_chave_groq
-GEMINI_API_KEY=sua_chave_gemini
-SECRET_KEY=chave-secreta-producao-muito-segura
-```
+Veja o `.env.example` para um modelo de arquivo local.
 
 > ⚠️ **IMPORTANTE**: Nunca commite chaves reais no Git! Use sempre variáveis de ambiente.
 
@@ -310,32 +311,15 @@ SECRET_KEY=chave-secreta-producao-muito-segura
 
 ## 🔧 Tecnologias Utilizadas
 
-- **Backend:** Flask 3.1.0
+- **Backend:** Flask 3.1.0 + gunicorn
 - **ORM:** SQLAlchemy + Flask-SQLAlchemy
-- **Banco:** PostgreSQL (prod) / SQLite (dev)
-- **IA:** Groq (LLaMA), Google Gemini
-- **OCR:** Pytesseract
+- **Banco:** PostgreSQL (prod) / SQLite (dev e testes)
+- **Autenticação:** JWT (PyJWT) + bcrypt
+- **IA:** Groq (LLaMA 3.3 no chatbot, Llama 4 Scout na leitura de comprovantes)
+- **OCR:** Pytesseract + Poppler
 - **Docs:** Flasgger (Swagger)
-- **Deploy:** Render
-- **CORS:** Flask-CORS
-
----
-
-## 👥 CORS - Origens Permitidas
-
-O backend aceita requisições das seguintes origens:
-
-```python
-origins = [
-    "http://localhost:5173",           # Vite dev
-    "http://localhost:3000",           # React dev
-    "http://localhost:5000",           # Flask dev
-    "https://sispar-sign.vercel.app",  # Produção
-    "https://projeto-sispar.vercel.app" # Produção alternativo
-]
-```
-
-Para adicionar novas origens, edite o arquivo `src/app.py`.
+- **Deploy:** Docker / Google Cloud Run
+- **Testes:** pytest (`FLASK_ENV=testing python -m pytest`)
 
 ---
 

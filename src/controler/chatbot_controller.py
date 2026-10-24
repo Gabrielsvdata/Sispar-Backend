@@ -1,4 +1,5 @@
 from flask import Blueprint, request, jsonify, g
+from src.security.auth import login_obrigatorio
 from openai import OpenAI
 import os
 from datetime import datetime
@@ -10,16 +11,39 @@ bp_chatbot = Blueprint('chatbot', __name__, url_prefix='/chatbot')
 
 # Configurar cliente Groq
 # Nota: A biblioteca OpenAI é compatível com a API do Groq
-GROQ_API_KEY = os.getenv('GROQ_API_KEY')
-if not GROQ_API_KEY:
-    raise ValueError("GROQ_API_KEY não configurada. Defina a variável de ambiente GROQ_API_KEY")
+GROQ_CHAT_MODEL = os.getenv('GROQ_CHAT_MODEL', 'llama-3.3-70b-versatile')
+_client = None
 
-client = OpenAI(
-    api_key=GROQ_API_KEY,
-    base_url="https://api.groq.com/openai/v1",
-    max_retries=2,
-    timeout=30.0
-)
+
+def get_client():
+    """Cria o cliente Groq só quando o chatbot é usado (a API sobe mesmo sem a chave)."""
+    global _client
+    if _client is None:
+        chave = os.getenv('GROQ_API_KEY')
+        if not chave:
+            return None
+        _client = OpenAI(
+            api_key=chave,
+            base_url="https://api.groq.com/openai/v1",
+            max_retries=2,
+            timeout=30.0
+        )
+    return _client
+
+
+def _historico_seguro(historico):
+    """Aceita do navegador só mensagens de usuário/assistente, em texto e com tamanho limitado."""
+    if not isinstance(historico, list):
+        return []
+    seguro = []
+    for item in historico[-10:]:
+        if not isinstance(item, dict):
+            continue
+        papel = item.get('role')
+        conteudo = item.get('content')
+        if papel in ('user', 'assistant') and isinstance(conteudo, str) and conteudo.strip():
+            seguro.append({'role': papel, 'content': conteudo[:2000]})
+    return seguro
 
 # System Prompt otimizado para o SISPAR
 SYSTEM_PROMPT = """Você é o assistente virtual do SISPAR, sistema de reembolsos corporativo da Wilson Sons.
@@ -211,6 +235,7 @@ def processar_contexto(colaborador_id, mensagem):
 
 
 @bp_chatbot.route('/message', methods=['POST', 'OPTIONS'])
+@login_obrigatorio()
 def enviar_mensagem():
     """
     Endpoint principal do chatbot
@@ -240,18 +265,12 @@ def enviar_mensagem():
         # Sanitizar mensagem (remover caracteres perigosos)
         mensagem_usuario = mensagem_usuario.replace('<', '').replace('>', '')
         
-        # IMPORTANTE: Pegar ID do colaborador do token/sessão
-        # Ajuste conforme seu sistema de autenticação:
-        colaborador_id = g.get('user_id') or data.get('colaborador_id') or request.headers.get('X-User-Id')
-        
-        if not colaborador_id:
-            return jsonify({'error': 'Usuário não autenticado'}), 401
-        
-        # Validar que colaborador_id é um número
-        try:
-            colaborador_id = int(colaborador_id)
-        except (ValueError, TypeError):
-            return jsonify({'error': 'ID de colaborador inválido'}), 400
+        # O colaborador vem sempre do token, nunca do corpo da requisição
+        colaborador_id = g.usuario_id
+
+        client = get_client()
+        if client is None:
+            return jsonify({'error': 'Assistente indisponível: GROQ_API_KEY não configurada'}), 503
         
         # Buscar contexto relevante do banco de dados
         contexto_banco = processar_contexto(colaborador_id, mensagem_usuario)
@@ -261,9 +280,8 @@ def enviar_mensagem():
             {"role": "system", "content": SYSTEM_PROMPT}
         ]
         
-        # Adicionar histórico (limitar a 10 últimas mensagens)
-        if historico and isinstance(historico, list):
-            mensagens.extend(historico[-10:])
+        # Adicionar histórico (limitar a 10 últimas mensagens, só usuário/assistente)
+        mensagens.extend(_historico_seguro(historico))
         
         # Adicionar contexto do banco se houver
         if contexto_banco:
@@ -280,7 +298,7 @@ def enviar_mensagem():
         
         # Chamar API do Groq com timeout
         completion = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+            model=GROQ_CHAT_MODEL,
             messages=mensagens,
             temperature=0.7,
             max_tokens=1024,
@@ -324,6 +342,6 @@ def health_check():
     return jsonify({
         'status': 'ok',
         'service': 'chatbot',
-        'model': 'llama-3.3-70b-versatile',
+        'model': GROQ_CHAT_MODEL,
         'provider': 'Groq'
     }), 200

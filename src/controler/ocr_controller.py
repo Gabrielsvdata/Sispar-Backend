@@ -1,4 +1,6 @@
-from flask import Blueprint, request, jsonify
+from flask import Blueprint, request, jsonify, current_app
+from src.security.auth import login_obrigatorio, pode_acessar_reembolso, sem_permissao
+from src.utils.arquivos import arquivo_temporario, hash_bytes, mime_por_extensao
 from src.utils.ocr_reader import processar_arquivo
 from src.model.comprovante_model import Comprovante
 from src.model.reembolso_model import Reembolso
@@ -14,58 +16,46 @@ ocr_bp = Blueprint("ocr_bp", __name__, url_prefix='/ocr')
 # CREATE - Upload e extração OCR
 # -------------------------------
 @ocr_bp.route("/", methods=["POST"])
+@login_obrigatorio()
 def ocr():
-    print(f"DEBUG OCR - Files: {request.files}")
-    print(f"DEBUG OCR - Form: {request.form}")
-    
     if "file" not in request.files:
-        print("ERROR OCR - Arquivo não encontrado no request.files")
         return jsonify({"erro": "Arquivo não encontrado"}), 400
 
     file = request.files["file"]
     reembolso_id = request.form.get("reembolso_id")
-    
-    print(f"DEBUG OCR - Filename: {file.filename}")
-    print(f"DEBUG OCR - Reembolso ID: {reembolso_id}")
-    
-    if file.filename.strip() == "":
+
+    if not file.filename or file.filename.strip() == "":
         return jsonify({"erro": "Nome do arquivo vazio"}), 400
-    
+
     if not reembolso_id:
         return jsonify({"erro": "ID do reembolso é obrigatório"}), 400
 
-    # Verifica se o reembolso existe
+    extensao = os.path.splitext(file.filename)[1].lower()
+    mime_type = mime_por_extensao(file.filename)
+    if not mime_type:
+        return jsonify({"erro": "Formato de arquivo inválido. Aceito apenas: PDF, JPG, JPEG, PNG"}), 400
+
+    # Verifica se o reembolso existe e pertence ao usuário
     reembolso = Reembolso.query.get(reembolso_id)
     if not reembolso:
-        print(f"ERROR OCR - Reembolso {reembolso_id} não encontrado")
         return jsonify({"erro": "Reembolso não encontrado"}), 404
-    
-    print(f"DEBUG OCR - Reembolso encontrado: {reembolso.num_prestacao}")
+    if not pode_acessar_reembolso(reembolso):
+        return sem_permissao()
 
-    # Caminho absoluto para o diretório temp
-    base_dir = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))  # /app
-    temp_dir = os.path.join(base_dir, 'temp')
-    os.makedirs(temp_dir, exist_ok=True)
-    
-    extensao = os.path.splitext(file.filename)[1]
-    nome_arquivo = f"{uuid.uuid4().hex}{extensao}"
-    caminho_temporario = os.path.join(temp_dir, nome_arquivo)
+    conteudo = file.read()
+    if not conteudo:
+        return jsonify({"erro": "Arquivo vazio"}), 400
 
     try:
-        # Salva o arquivo temporariamente
-        file.save(caminho_temporario)
-        print(f"DEBUG OCR - Arquivo salvo em: {caminho_temporario}")
+        # OCR precisa de um arquivo em disco; ele é apagado logo depois
+        with arquivo_temporario(conteudo, extensao) as caminho:
+            resultado_ocr = processar_arquivo(caminho)
 
-        # Processa arquivo (PDF ou imagem) e extrai texto e valores
-        print("DEBUG OCR - Iniciando processamento OCR...")
-        resultado_ocr = processar_arquivo(caminho_temporario)
-        print(f"DEBUG OCR - Resultado OCR: {resultado_ocr}")
-        
         texto = resultado_ocr['texto']
         valor_extraido = resultado_ocr['valor_extraido']
-        print(f"DEBUG OCR - Valor extraído: {valor_extraido}")
 
         # Valida o valor extraído contra o valor do reembolso
+        validacao = None
         if valor_extraido:
             validacao = validar_valores(
                 valor_solicitado=reembolso.valor_faturado,
@@ -78,47 +68,40 @@ def ocr():
             status_validacao = 'Pendente'
             discrepancia = None
 
-        # Salva no banco de dados
         comprovante = Comprovante(
-            nome_arquivo=nome_arquivo,
+            nome_arquivo=f"{uuid.uuid4().hex}{extensao}",
             texto_extraido=texto,
-            reembolso_id=reembolso_id,
+            reembolso_id=reembolso.num_prestacao,
             valor_extraido=valor_extraido,
             status_validacao=status_validacao,
-            discrepancia_percentual=discrepancia
+            discrepancia_percentual=discrepancia,
+            hash_arquivo=hash_bytes(conteudo),
+            arquivo=conteudo,
+            mime_type=mime_type,
         )
         db.session.add(comprovante)
-        
-        # Atualiza o reembolso com o comprovante
+        db.session.flush()  # gera o id antes de vincular ao reembolso
         reembolso.comprovante_id = comprovante.id
-        
         db.session.commit()
 
         return jsonify({
             "mensagem": "Comprovante processado com sucesso.",
             "comprovante": comprovante.to_dict(),
             "valores_encontrados": [float(v) for v in resultado_ocr['valores_encontrados']],
-            "validacao": validacao if valor_extraido else {"mensagem": "Valor não encontrado no comprovante"}
+            "validacao": validacao or {"mensagem": "Valor não encontrado no comprovante"}
         }), 201
 
     except Exception as e:
-        print(f"DEBUG - EXCEPTION CAPTURADA: {type(e).__name__}: {str(e)}")
-        import traceback
-        print(f"DEBUG - TRACEBACK:\n{traceback.format_exc()}")
+        current_app.logger.exception("Erro ao processar comprovante")
         db.session.rollback()
-        # Remove o arquivo se houver erro
-        if os.path.exists(caminho_temporario):
-            os.remove(caminho_temporario)
         return jsonify({"erro": f"Erro ao processar comprovante: {str(e)}"}), 500
-
-    # Arquivo mantido para análise IA posterior
-    # NÃO deletar: a IA precisa acessar o arquivo original
 
 
 # -------------------------------
 # READ - Listar comprovantes
 # -------------------------------
 @ocr_bp.route("/", methods=["GET"])
+@login_obrigatorio('admin')
 def listar_ocr():
     comprovantes = Comprovante.query.order_by(Comprovante.data_criacao.desc()).all()
     resultados = [
@@ -137,10 +120,14 @@ def listar_ocr():
 # READ - Obter um comprovante
 # -------------------------------
 @ocr_bp.route("/<int:id>", methods=["GET"])
+@login_obrigatorio()
 def obter_ocr(id):
     comprovante = Comprovante.query.get(id)
     if not comprovante:
         return jsonify({"erro": "Comprovante não encontrado"}), 404
+    reembolso = Reembolso.query.get(comprovante.reembolso_id)
+    if not reembolso or not pode_acessar_reembolso(reembolso):
+        return sem_permissao()
 
     return jsonify(comprovante.to_dict()), 200
 
@@ -149,6 +136,7 @@ def obter_ocr(id):
 # VALIDAÇÃO - Revalidar comprovante
 # -------------------------------
 @ocr_bp.route("/<int:id>/revalidar", methods=["POST"])
+@login_obrigatorio('admin')
 def revalidar_comprovante(id):
     """
     Revalida um comprovante comparando com o valor do reembolso

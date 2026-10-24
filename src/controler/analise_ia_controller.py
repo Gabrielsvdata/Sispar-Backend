@@ -1,433 +1,172 @@
-from flask import Blueprint, request, jsonify, send_file, g
+from flask import Blueprint, request, jsonify, send_file, current_app
 from src.model import db
 from src.model.reembolso_model import Reembolso
 from src.model.comprovante_model import Comprovante
 from src.model.analise_ia_model import AnaliseIA
+from src.security.auth import login_obrigatorio, pode_acessar_reembolso, sem_permissao
+from src.utils.arquivos import ler_arquivo_comprovante, hash_bytes
+from src.utils.analise_comprovante import extrair_dados_com_ia, montar_analise, MODELO_VISAO
 from src.utils.ia_utils import (
-    calcular_hash_imagem,
-    converter_para_base64,
     detectar_duplicatas,
     analisar_historico_colaborador,
     analisar_padroes_comportamentais,
     calcular_score_confiabilidade,
     gerar_recomendacao
 )
-import google.generativeai as genai
-import os
+import io
 import json
 from datetime import datetime
-from decimal import Decimal
 
 bp_analise_ia = Blueprint('analise_ia', __name__, url_prefix='/reembolsos')
 
-# Configurar Google Gemini
-GEMINI_API_KEY = os.getenv('GEMINI_API_KEY', 'SUA_API_KEY_AQUI')  # Você vai definir no .env
-genai.configure(api_key=GEMINI_API_KEY)
+
+class AnaliseIndisponivel(Exception):
+    """Reembolso sem comprovante ou arquivo para analisar."""
 
 
-def analisar_sem_vision_api(comprovante, reembolso):
+def executar_analise(reembolso):
     """
-    Análise de fallback sem Vision API - usa apenas dados do OCR
+    Roda a análise completa de um reembolso e devolve (AnaliseIA, detalhes).
+
+    1. A IA lê o comprovante (se disponível); senão, usa o valor do OCR.
+    2. Validações, duplicatas, histórico e score são calculados em Python.
     """
-    valor_extraido = float(comprovante.valor_extraido) if comprovante.valor_extraido else 0.0
-    valor_declarado = float(reembolso.despesa) if reembolso.despesa else 0.0
-    
-    # Validação de valor - considera correspondente se diferença for <= 5%
-    diferenca_percentual = abs(valor_declarado - valor_extraido) / valor_declarado * 100 if valor_declarado > 0 else 100
-    valor_corresponde = diferenca_percentual <= 5 if valor_extraido > 0 else False
-    
-    return {
-        'dados_extraidos': {
-            'valor_total': valor_extraido,
-            'data_emissao': None,
-            'cnpj': None,
-            'razao_social': None,
-            'itens': [],
-            'forma_pagamento': None,
-            'numero_nota': None
-        },
-        'validacoes': {
-            'valor_corresponde': valor_corresponde,
-            'divergencia_percentual': round(diferenca_percentual, 2) if valor_declarado > 0 else 100.0,
-            'data_valida': True,
-            'data_comprovante': None,
-            'estabelecimento_valido': False,
-            'tipo_despesa_correto': False,
-            'tipo_detectado': None,
-            'comprovante_legivel': valor_extraido > 0,
-            'qualidade_imagem': 0.5 if valor_extraido > 0 else 0.0
-        },
-        'sinais_fraude': {
-            'editado': False,
-            'confianca_edicao': 0.0,
-            'inconsistencias_visuais': False,
-            'layout_suspeito': False,
-            'metadados_originais': True
-        },
-        'observacoes': 'Análise realizada apenas com OCR. Vision API indisponível. ' + 
-                      (f'Valor extraído: R$ {valor_extraido:.2f}' if valor_extraido > 0 else 'Não foi possível extrair valor do comprovante.')
+    comprovante = Comprovante.query.filter_by(reembolso_id=reembolso.num_prestacao).first()
+    if not comprovante:
+        raise AnaliseIndisponivel('Comprovante não disponível para análise. Faça o upload do comprovante primeiro.')
+
+    conteudo, mime_type = ler_arquivo_comprovante(comprovante)
+    if not conteudo:
+        raise AnaliseIndisponivel('Arquivo do comprovante não encontrado. Faça o upload novamente.')
+
+    dados_ia, motivo_falha = extrair_dados_com_ia(conteudo, mime_type)
+    if motivo_falha:
+        current_app.logger.warning(f"Análise IA indisponível, usando OCR: {motivo_falha}")
+    analise_comprovante = montar_analise(dados_ia, reembolso, comprovante)
+    fonte = 'ia' if dados_ia else 'ocr'
+
+    if not comprovante.hash_arquivo:
+        comprovante.hash_arquivo = hash_bytes(conteudo)
+    duplicatas = detectar_duplicatas(comprovante.hash_arquivo, reembolso.num_prestacao)
+
+    historico = analisar_historico_colaborador(reembolso.id_colaborador)
+    reembolsos_anteriores = Reembolso.query.filter_by(
+        id_colaborador=reembolso.id_colaborador
+    ).filter(Reembolso.num_prestacao != reembolso.num_prestacao).all()
+    padroes = analisar_padroes_comportamentais(reembolso, reembolsos_anteriores)
+
+    validacoes = analise_comprovante['validacoes']
+    score, nivel_risco, alertas = calcular_score_confiabilidade(
+        validacoes, duplicatas, padroes, analise_comprovante['sinais_fraude']
+    )
+    if fonte == 'ocr':
+        alertas.append({
+            'tipo': 'analise_sem_ia',
+            'gravidade': 'baixa',
+            'mensagem': 'Leitura por IA indisponível no momento; análise feita só com o OCR.',
+            'confianca': 1.0
+        })
+    aprovacao_sugerida, motivo_sugestao = gerar_recomendacao(score, nivel_risco, alertas)
+
+    versao_modelo = MODELO_VISAO if fonte == 'ia' else 'ocr-tesseract'
+    analise = AnaliseIA(
+        num_prestacao=reembolso.num_prestacao,
+        score_confiabilidade=score,
+        nivel_risco=nivel_risco,
+        aprovacao_sugerida=aprovacao_sugerida,
+        motivo_sugestao=motivo_sugestao,
+        dados_ia=analise_comprovante['dados_extraidos'],
+        alertas=alertas,
+        validacoes=validacoes,
+        historico_colaborador=historico,
+        versao_modelo=versao_modelo[:50]
+    )
+    detalhes = {
+        'fonte_leitura': fonte,
+        'versao_modelo': versao_modelo,
+        'alertas': alertas,
+        'validacoes': validacoes,
+        'dados_extraidos_ocr': analise_comprovante['dados_extraidos'],
+        'observacoes_ia': analise_comprovante['observacoes'],
+        'historico_colaborador': historico,
+        'analise_padrao': padroes,
+        'comprovantes_similares': [
+            {'num_prestacao': d['reembolso_id'], 'nome_arquivo': d['nome_arquivo']} for d in duplicatas
+        ],
     }
-
-
-def analisar_comprovante_gemini_vision(caminho_arquivo, reembolso):
-    """
-    Analisa comprovante usando Google Gemini Vision API
-    FALLBACK: Se Vision API falhar, retorna análise baseada em OCR
-    
-    Args:
-        caminho_arquivo: Path completo do arquivo de imagem
-        reembolso: Objeto Reembolso com dados declarados
-        
-    Returns:
-        Dict com dados extraídos e validações
-    """
-    try:
-        # Montar prompt detalhado
-        prompt = f"""Analise este comprovante fiscal brasileiro com extrema atenção aos detalhes para detectar possíveis fraudes.
-
-DADOS DECLARADOS PELO USUÁRIO:
-- Valor: R$ {reembolso.despesa}
-- Data da solicitação: {reembolso.data.strftime('%d/%m/%Y') if reembolso.data else 'N/A'}
-- Tipo de despesa: {reembolso.tipo_reembolso}
-- Descrição: {reembolso.descricao or 'Não informada'}
-
-TAREFAS DE ANÁLISE:
-
-1. EXTRAÇÃO DE DADOS:
-   - Valor total pago (em reais)
-   - Data de emissão do documento
-   - CNPJ do estabelecimento (se visível)
-   - Nome/Razão social do estabelecimento
-   - Itens/produtos/serviços (lista)
-   - Forma de pagamento (se visível)
-   - Número da nota fiscal (se houver)
-
-2. VALIDAÇÕES:
-   - O valor declarado ({reembolso.despesa}) corresponde ao valor do comprovante?
-   - A data do comprovante é anterior ou igual à data da solicitação?
-   - O tipo de estabelecimento corresponde ao tipo de despesa declarado ({reembolso.tipo_reembolso})?
-   - O documento está legível e completo?
-   - Há informações essenciais faltando?
-
-3. DETECÇÃO DE FRAUDE:
-   - Existem sinais de edição digital da imagem?
-   - Existem inconsistências visuais (fontes diferentes, alinhamentos estranhos)?
-   - A qualidade da imagem é suspeita (muito perfeita ou muito ruim)?
-   - O layout do documento parece autêntico?
-
-RESPONDA APENAS EM JSON no seguinte formato (sem markdown, sem backticks):
-{{
-  "dados_extraidos": {{
-    "valor_total": 150.50,
-    "data_emissao": "2025-12-20",
-    "cnpj": "12.345.678/0001-90",
-    "razao_social": "Nome do Estabelecimento",
-    "itens": ["item 1", "item 2"],
-    "forma_pagamento": "Débito",
-    "numero_nota": "123456"
-  }},
-  "validacoes": {{
-    "valor_corresponde": true,
-    "divergencia_percentual": 0.0,
-    "data_valida": true,
-    "data_comprovante": "2025-12-20",
-    "estabelecimento_valido": true,
-    "tipo_despesa_correto": true,
-    "tipo_detectado": "Combustível",
-    "comprovante_legivel": true,
-    "qualidade_imagem": 0.95
-  }},
-  "sinais_fraude": {{
-    "editado": false,
-    "confianca_edicao": 0.0,
-    "inconsistencias_visuais": false,
-    "layout_suspeito": false,
-    "metadados_originais": true
-  }},
-  "observacoes": "Lista de observações importantes encontradas"
-}}"""
-        
-        # Upload do arquivo para Gemini
-        uploaded_file = genai.upload_file(caminho_arquivo)
-        
-        # Criar modelo Gemini (usando modelo disponível)
-        model = genai.GenerativeModel('gemini-1.5-pro')
-        
-        # Gerar resposta
-        response = model.generate_content([prompt, uploaded_file])
-        
-        # Extrair e parsear resposta
-        resposta_texto = response.text.strip()
-        
-        # Remover markdown se houver
-        if resposta_texto.startswith('```'):
-            resposta_texto = resposta_texto.split('```')[1]
-            if resposta_texto.startswith('json'):
-                resposta_texto = resposta_texto[4:]
-        
-        dados_ia = json.loads(resposta_texto)
-        
-        return dados_ia
-    
-    except json.JSONDecodeError as e:
-        print(f"Erro ao parsear JSON da IA: {e}")
-        print(f"Resposta recebida: {resposta_texto}")
-        return {
-            'erro': 'Resposta da IA não está em formato JSON válido',
-            'dados_extraidos': {},
-            'validacoes': {'comprovante_legivel': False},
-            'sinais_fraude': {}
-        }
-    
-    except Exception as e:
-        print(f"Erro ao analisar com Gemini Vision: {e}")
-        import traceback
-        traceback.print_exc()
-        
-        return {
-            'erro': str(e),
-            'dados_extraidos': {},
-            'validacoes': {},
-            'sinais_fraude': {}
-        }
+    return analise, detalhes
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # ENDPOINTS
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-@bp_analise_ia.route('/<string:num_prestacao>/comprovante', methods=['GET', 'OPTIONS'])
+@bp_analise_ia.route('/<int:num_prestacao>/comprovante', methods=['GET', 'OPTIONS'])
+@login_obrigatorio()
 def obter_comprovante(num_prestacao):
     """
     GET /reembolsos/{num_prestacao}/comprovante
     Retorna o arquivo do comprovante (PDF ou imagem)
     """
-    if request.method == 'OPTIONS':
-        return '', 200
-    
-    try:
-        # Buscar reembolso
-        reembolso = Reembolso.query.filter_by(num_prestacao=num_prestacao).first()
-        
-        if not reembolso:
-            return jsonify({'erro': 'Reembolso não encontrado'}), 404
-        
-        # Buscar comprovante
-        comprovante = Comprovante.query.filter_by(reembolso_id=reembolso.num_prestacao).first()
-        
-        if not comprovante:
-            return jsonify({'erro': 'Comprovante não disponível'}), 400
-        
-        # Caminho absoluto do arquivo
-        # Em produção Docker: /app/temp/arquivo.png
-        base_dir = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))  # /app
-        caminho_arquivo = os.path.join(base_dir, 'temp', comprovante.nome_arquivo)
-        
-        print(f"DEBUG - Tentando abrir arquivo: {caminho_arquivo}")
-        print(f"DEBUG - Arquivo existe: {os.path.exists(caminho_arquivo)}")
-        
-        if not os.path.exists(caminho_arquivo):
-            return jsonify({
-                'erro': 'Arquivo do comprovante não encontrado no servidor',
-                'caminho_procurado': caminho_arquivo
-            }), 404
-        
-        # Determinar tipo de arquivo
-        extensao = os.path.splitext(comprovante.nome_arquivo)[1].lower()
-        mime_type = 'application/pdf' if extensao == '.pdf' else 'image/jpeg'
-        
-        # Retornar arquivo
-        return send_file(
-            caminho_arquivo,
-            mimetype=mime_type,
-            as_attachment=False,  # Mudado para False para permitir visualização no navegador
-            download_name=f"comprovante_{num_prestacao}{extensao}"
-        )
-    
-    except Exception as e:
-        print(f"Erro ao obter comprovante: {e}")
-        import traceback
-        traceback.print_exc()
-        return jsonify({'erro': str(e)}), 500
+    reembolso = Reembolso.query.get(num_prestacao)
+    if not reembolso:
+        return jsonify({'erro': 'Reembolso não encontrado'}), 404
+    if not pode_acessar_reembolso(reembolso):
+        return sem_permissao()
+
+    comprovante = Comprovante.query.filter_by(reembolso_id=num_prestacao).first()
+    if not comprovante:
+        return jsonify({'erro': 'Comprovante não disponível'}), 400
+
+    conteudo, mime_type = ler_arquivo_comprovante(comprovante)
+    if not conteudo:
+        return jsonify({'erro': 'Arquivo do comprovante não encontrado no servidor'}), 404
+
+    extensao = '.pdf' if mime_type == 'application/pdf' else ('.png' if mime_type == 'image/png' else '.jpg')
+    return send_file(
+        io.BytesIO(conteudo),
+        mimetype=mime_type or 'application/octet-stream',
+        as_attachment=False,  # permite visualizar no navegador
+        download_name=f"comprovante_{num_prestacao}{extensao}"
+    )
 
 
-@bp_analise_ia.route('/<string:num_prestacao>/analisar-ia', methods=['POST', 'OPTIONS'])
+@bp_analise_ia.route('/<int:num_prestacao>/analisar-ia', methods=['POST', 'OPTIONS'])
+@login_obrigatorio('admin')
 def analisar_reembolso_ia(num_prestacao):
     """
     POST /reembolsos/{num_prestacao}/analisar-ia
     Executa análise completa com IA do reembolso e comprovante
     """
-    if request.method == 'OPTIONS':
-        return '', 200
-    
+    reembolso = Reembolso.query.get(num_prestacao)
+    if not reembolso:
+        return jsonify({'erro': 'Reembolso não encontrado'}), 404
+
     try:
-        print(f"DEBUG - Iniciando análise IA do reembolso {num_prestacao}")
-        
-        # 1. BUSCAR DADOS
-        reembolso = Reembolso.query.filter_by(num_prestacao=num_prestacao).first()
-        
-        if not reembolso:
-            print(f"DEBUG - Reembolso {num_prestacao} não encontrado")
-            return jsonify({'erro': 'Reembolso não encontrado'}), 404
-        
-        print(f"DEBUG - Reembolso encontrado: {reembolso.num_prestacao}")
-        
-        comprovante = Comprovante.query.filter_by(reembolso_id=reembolso.num_prestacao).first()
-        
-        if not comprovante:
-            print(f"DEBUG - Comprovante não encontrado para reembolso {reembolso.num_prestacao}")
-            return jsonify({
-                'erro': 'Comprovante não disponível para análise',
-                'mensagem': 'Você precisa fazer o upload do comprovante primeiro na tela de criação/edição do reembolso.'
-            }), 404
-        
-        print(f"DEBUG - Comprovante encontrado: {comprovante.nome_arquivo}")
-        
-        # Caminho absoluto do arquivo
-        base_dir = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))  # /app
-        caminho_arquivo = os.path.join(base_dir, 'temp', comprovante.nome_arquivo)
-        
-        print(f"DEBUG - Caminho do arquivo: {caminho_arquivo}")
-        
-        if not os.path.exists(caminho_arquivo):
-            print(f"DEBUG - Arquivo não encontrado em: {caminho_arquivo}")
-            return jsonify({
-                'erro': 'Arquivo do comprovante não encontrado no servidor',
-                'mensagem': 'O arquivo foi removido ou perdido. Por favor, faça o upload do comprovante novamente.',
-                'arquivo_esperado': comprovante.nome_arquivo,
-                'caminho_procurado': caminho_arquivo
-            }), 404
-        
-        print(f"DEBUG - Arquivo encontrado: {caminho_arquivo}")
-        
-        # 2. ANÁLISE COM GEMINI VISION API (com fallback para OCR)
-        try:
-            dados_ia = analisar_comprovante_gemini_vision(caminho_arquivo, reembolso)
-            
-            # Se Vision API falhou, usar fallback
-            if 'erro' in dados_ia:
-                print(f"AVISO - Vision API indisponível, usando análise baseada em OCR")
-                dados_ia = analisar_sem_vision_api(comprovante, reembolso)
-        except Exception as e:
-            print(f"ERRO - Falha na análise Vision, usando fallback OCR: {e}")
-            dados_ia = analisar_sem_vision_api(comprovante, reembolso)
-        
-        if 'erro' in dados_ia and 'decommissioned' not in str(dados_ia.get('erro', '')).lower():
-            # Análise falhou por outro motivo
-            print(f"AVISO - Análise IA falhou: {dados_ia['erro']}")
-            return jsonify({
-                'num_prestacao': num_prestacao,
-                'score_confiabilidade': 50,
-                'nivel_risco': 'medio',
-                'aprovacao_sugerida': False,
-                'motivo_sugestao': f"Análise IA falhou: {dados_ia['erro']}. Revisão manual necessária.",
-                'erro_ia': dados_ia['erro'],
-                'alertas': [{
-                    'tipo': 'erro_analise',
-                    'gravidade': 'alta',
-                    'mensagem': 'Não foi possível completar análise automática',
-                    'confianca': 1.0
-                }]
-            }), 500
-        
-        print(f"DEBUG - Dados IA extraídos com sucesso")
-        
-        # 3. DETECÇÃO DE DUPLICATAS
-        if comprovante.hash_arquivo:
-            duplicatas = detectar_duplicatas(comprovante.hash_arquivo, num_prestacao)
-        else:
-            # Calcular hash agora se não existir
-            hash_novo = calcular_hash_imagem(caminho_arquivo)
-            if hash_novo:
-                comprovante.hash_arquivo = hash_novo
-                db.session.commit()
-                duplicatas = detectar_duplicatas(hash_novo, num_prestacao)
-            else:
-                duplicatas = []
-        
-        print(f"DEBUG - Duplicatas encontradas: {len(duplicatas)}")
-        
-        # 4. ANÁLISE DE HISTÓRICO DO COLABORADOR
-        historico = analisar_historico_colaborador(reembolso.id_colaborador)
-        print(f"DEBUG - Histórico do colaborador analisado")
-        
-        # 5. ANÁLISE DE PADRÕES COMPORTAMENTAIS
-        reembolsos_anteriores = Reembolso.query.filter_by(
-            id_colaborador=reembolso.id_colaborador
-        ).filter(
-            Reembolso.num_prestacao != num_prestacao
-        ).all()
-        
-        padroes = analisar_padroes_comportamentais(reembolso, reembolsos_anteriores)
-        print(f"DEBUG - Padrões comportamentais analisados")
-        
-        # 6. CALCULAR SCORE FINAL
-        validacoes = dados_ia.get('validacoes', {})
-        sinais_fraude = dados_ia.get('sinais_fraude', {})
-        
-        score, nivel_risco, alertas = calcular_score_confiabilidade(
-            validacoes,
-            duplicatas,
-            padroes,
-            sinais_fraude
-        )
-        
-        print(f"DEBUG - Score calculado: {score}")
-        
-        # 7. GERAR RECOMENDAÇÃO
-        aprovacao_sugerida, motivo_sugestao = gerar_recomendacao(score, nivel_risco, alertas)
-        
-        # 8. SALVAR ANÁLISE NO BANCO
-        analise = AnaliseIA(
-            num_prestacao=num_prestacao,
-            score_confiabilidade=score,
-            nivel_risco=nivel_risco,
-            aprovacao_sugerida=aprovacao_sugerida,
-            motivo_sugestao=motivo_sugestao,
-            dados_ia=dados_ia.get('dados_extraidos', {}),
-            alertas=alertas,
-            validacoes=validacoes,
-            historico_colaborador=historico
-        )
-        
+        analise, detalhes = executar_analise(reembolso)
         db.session.add(analise)
         db.session.commit()
-        
-        print(f"DEBUG - Análise salva no banco com ID {analise.id}")
-        
-        # 9. MONTAR RESPOSTA COMPLETA
-        response = {
-            'num_prestacao': num_prestacao,
-            'score_confiabilidade': score,
-            'nivel_risco': nivel_risco,
-            'aprovacao_sugerida': aprovacao_sugerida,
-            'motivo_sugestao': motivo_sugestao,
-            'alertas': alertas,
-            'validacoes': validacoes,
-            'dados_extraidos_ocr': dados_ia.get('dados_extraidos', {}),
-            'historico_colaborador': historico,
-            'analise_padrao': padroes,
-            'comprovantes_similares': [{'num_prestacao': d['reembolso_id'], 'nome_arquivo': d['nome_arquivo']} for d in duplicatas],
-            'recomendacao_ia': motivo_sugestao,
-            'timestamp_analise': datetime.now().isoformat(),
-            'versao_modelo': 'gemini-1.5-pro'
-        }
-        
-        return jsonify(response), 200
-    
+    except AnaliseIndisponivel as e:
+        return jsonify({'erro': 'Comprovante não disponível para análise', 'mensagem': str(e)}), 404
     except Exception as e:
-        print(f"Erro na análise IA: {e}")
-        import traceback
-        traceback.print_exc()
-        
         db.session.rollback()
+        current_app.logger.exception('Erro na análise IA')
         return jsonify({'erro': str(e)}), 500
 
-
-# Implementação continua no próximo arquivo...
+    return jsonify({
+        'num_prestacao': num_prestacao,
+        'score_confiabilidade': analise.score_confiabilidade,
+        'nivel_risco': analise.nivel_risco,
+        'aprovacao_sugerida': analise.aprovacao_sugerida,
+        'motivo_sugestao': analise.motivo_sugestao,
+        'recomendacao_ia': analise.motivo_sugestao,
+        'timestamp_analise': datetime.now().isoformat(),
+        **detalhes,
+    }), 200
 
 
 @bp_analise_ia.route('/analises-ia', methods=['GET', 'OPTIONS'])
+@login_obrigatorio('admin')
 def listar_analises_ia():
     """
     GET /reembolsos/analises-ia?status=pendente&risco=alto&limit=50
@@ -507,7 +246,8 @@ def listar_analises_ia():
         return jsonify({'erro': str(e)}), 500
 
 
-@bp_analise_ia.route('/<string:num_prestacao>/aprovar-com-ia', methods=['POST', 'OPTIONS'])
+@bp_analise_ia.route('/<int:num_prestacao>/aprovar-com-ia', methods=['POST', 'OPTIONS'])
+@login_obrigatorio('admin')
 def aprovar_com_ia(num_prestacao):
     """
     POST /reembolsos/{num_prestacao}/aprovar-com-ia
@@ -517,7 +257,7 @@ def aprovar_com_ia(num_prestacao):
         return '', 200
     
     try:
-        data = request.get_json()
+        data = request.get_json(silent=True) or {}
         
         # Buscar reembolso
         reembolso = Reembolso.query.filter_by(num_prestacao=num_prestacao).first()
@@ -566,6 +306,7 @@ def aprovar_com_ia(num_prestacao):
 
 
 @bp_analise_ia.route('/analisar-lote', methods=['POST', 'OPTIONS'])
+@login_obrigatorio('admin')
 def analisar_lote():
     """
     POST /reembolsos/analisar-lote
@@ -604,56 +345,14 @@ def analisar_lote():
                     erros.append({'num_prestacao': num, 'erro': 'Reembolso não encontrado'})
                     continue
                 
-                comprovante = Comprovante.query.filter_by(reembolso_id=reembolso.num_prestacao).first()
-                
-                if not comprovante:
-                    erros.append({'num_prestacao': num, 'erro': 'Comprovante não disponível'})
+                try:
+                    analise, _detalhes = executar_analise(reembolso)
+                except AnaliseIndisponivel as e:
+                    erros.append({'num_prestacao': num, 'erro': str(e)})
                     continue
-                
-                base_dir = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))  # /app
-                caminho_arquivo = os.path.join(base_dir, 'temp', comprovante.nome_arquivo)
-                
-                if not os.path.exists(caminho_arquivo):
-                    erros.append({'num_prestacao': num, 'erro': 'Arquivo não encontrado'})
-                    continue
-                
-                # Executar análise (código simplificado, reaproveita lógica do endpoint principal)
-                dados_ia = analisar_comprovante_gemini_vision(caminho_arquivo, reembolso)
-                
-                if 'erro' in dados_ia:
-                    erros.append({'num_prestacao': num, 'erro': dados_ia['erro']})
-                    continue
-                
-                # Cálculos básicos
-                historico = analisar_historico_colaborador(reembolso.id_colaborador)
-                reembolsos_anteriores = Reembolso.query.filter_by(id_colaborador=reembolso.id_colaborador).filter(Reembolso.num_prestacao != num).all()
-                padroes = analisar_padroes_comportamentais(reembolso, reembolsos_anteriores)
-                
-                hash_arquivo = comprovante.hash_arquivo or calcular_hash_imagem(caminho_arquivo)
-                duplicatas = detectar_duplicatas(hash_arquivo, num) if hash_arquivo else []
-                
-                score, nivel_risco, alertas = calcular_score_confiabilidade(
-                    dados_ia.get('validacoes', {}),
-                    duplicatas,
-                    padroes,
-                    dados_ia.get('sinais_fraude', {})
-                )
-                
-                aprovacao_sugerida, motivo = gerar_recomendacao(score, nivel_risco, alertas)
-                
-                # Salvar análise
-                analise = AnaliseIA(
-                    num_prestacao=num,
-                    score_confiabilidade=score,
-                    nivel_risco=nivel_risco,
-                    aprovacao_sugerida=aprovacao_sugerida,
-                    motivo_sugestao=motivo,
-                    dados_ia=dados_ia.get('dados_extraidos', {}),
-                    alertas=alertas,
-                    validacoes=dados_ia.get('validacoes', {}),
-                    historico_colaborador=historico
-                )
-                
+                score = analise.score_confiabilidade
+                aprovacao_sugerida = analise.aprovacao_sugerida
+
                 db.session.add(analise)
                 
                 resultados.append({

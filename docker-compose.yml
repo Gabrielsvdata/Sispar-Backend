@@ -1,34 +1,35 @@
-version: "3.8"
-
+# Ambiente local: API + Postgres
 services:
   backend:
     build: .
     container_name: sispar_backend
     ports:
-      - "5000:5000"
-    volumes:
-      - .:/app
-    environment:
-      - FLASK_ENV=development
+      - "8080:8080"
     env_file:
       - .env
+    environment:
+      - FLASK_ENV=production
+      - DATABASE_URL=postgresql://sispar:sispar@sispar-db:5432/sispar
+      - DEMO_MODE=true
     depends_on:
-      - sispar-db
-    command: /bin/sh -c "sleep 20 && python run.py"
+      sispar-db:
+        condition: service_healthy
 
   sispar-db:
-    image: mysql:8.0
+    image: postgres:16
     container_name: sispar-db
     ports:
-      - "3307:3306"
+      - "5433:5432"
     environment:
-      MYSQL_ROOT_PASSWORD: root
-      MYSQL_DATABASE: sispar
-      MYSQL_USER: user
-      MYSQL_PASSWORD: userpass
-    command: --default-authentication-plugin=mysql_native_password
+      POSTGRES_USER: sispar
+      POSTGRES_PASSWORD: sispar
+      POSTGRES_DB: sispar
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sispar"]
+      interval: 3s
+      retries: 10
     volumes:
-      - db_data:/var/lib/mysql
+      - db_data:/var/lib/postgresql/data
 
 volumes:
   db_data:
