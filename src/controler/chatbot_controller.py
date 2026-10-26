@@ -88,6 +88,7 @@ INSTRUÇÕES DE COMPORTAMENTO:
 - Seja proativo sugerindo próximas ações
 - Use os dados fornecidos do banco de dados
 - Nunca invente informações que não possui
+- Responda em texto simples, sem Markdown (nada de **, # ou tabelas): o chat não formata
 """
 
 
@@ -309,7 +310,8 @@ def enviar_mensagem():
         )
         
         # Extrair resposta
-        resposta = sem_raciocinio(completion.choices[0].message.content)
+        # O chat do front mostra texto puro; tira o negrito em Markdown se o modelo usar
+        resposta = sem_raciocinio(completion.choices[0].message.content).replace('**', '')
         
         # Gerar sugestões de próximas perguntas
         sugestoes = [
