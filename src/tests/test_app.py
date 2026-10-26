@@ -248,3 +248,46 @@ def test_chatbot_descarta_mensagens_de_sistema_do_historico():
         {"role": "user", "content": "oi"},
         {"role": "assistant", "content": "olá"},
     ]
+
+
+# ─── Escolha de modelo no Groq ──────────────────────────────
+
+class _Erro400(Exception):
+    status_code = 400
+
+
+class _ClienteFalso:
+    """Imita o cliente do Groq: lista de modelos e chat que recusa parâmetros."""
+
+    def __init__(self, modelos, recusar=()):
+        self.chamadas = []
+        self.recusar = recusar
+        self.models = type("M", (), {"list": lambda _: type("L", (), {"data": [type("X", (), {"id": m}) for m in modelos]})})()
+        self.chat = type("C", (), {"completions": type("P", (), {"create": self._create})()})()
+
+    def _create(self, **parametros):
+        self.chamadas.append(parametros)
+        if any(chave in parametros for chave in self.recusar):
+            raise _Erro400("parâmetro não suportado")
+        return "ok"
+
+
+def test_escolhe_primeiro_modelo_disponivel(monkeypatch):
+    from src.utils import modelos_groq
+
+    monkeypatch.setattr(modelos_groq, "_disponiveis", None)
+    monkeypatch.delenv("GROQ_CHAT_MODEL", raising=False)
+    cliente = _ClienteFalso(["llama-3.1-8b-instant", "openai/gpt-oss-20b"])
+    assert modelos_groq.escolher_modelo(cliente, modelos_groq.MODELOS_TEXTO, "GROQ_CHAT_MODEL") == "openai/gpt-oss-20b"
+
+    monkeypatch.setenv("GROQ_CHAT_MODEL", "modelo-forcado")
+    assert modelos_groq.escolher_modelo(cliente, modelos_groq.MODELOS_TEXTO, "GROQ_CHAT_MODEL") == "modelo-forcado"
+
+
+def test_completar_tenta_de_novo_sem_parametros_opcionais():
+    from src.utils.modelos_groq import completar, sem_raciocinio
+
+    cliente = _ClienteFalso([], recusar=("extra_body", "response_format"))
+    assert completar(cliente, "qwen/qwen3.8-27b", messages=[], response_format={"type": "json_object"}) == "ok"
+    assert len(cliente.chamadas) == 3
+    assert sem_raciocinio("<think>pensando...</think>\n{\"a\": 1}") == '{"a": 1}'

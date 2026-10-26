@@ -5,7 +5,7 @@ from src.model.comprovante_model import Comprovante
 from src.model.analise_ia_model import AnaliseIA
 from src.security.auth import login_obrigatorio, pode_acessar_reembolso, sem_permissao
 from src.utils.arquivos import ler_arquivo_comprovante, hash_bytes
-from src.utils.analise_comprovante import extrair_dados_com_ia, montar_analise, MODELO_VISAO
+from src.utils.analise_comprovante import extrair_dados_com_ia, montar_analise
 from src.utils.ia_utils import (
     detectar_duplicatas,
     analisar_historico_colaborador,
@@ -68,7 +68,7 @@ def executar_analise(reembolso):
         })
     aprovacao_sugerida, motivo_sugestao = gerar_recomendacao(score, nivel_risco, alertas)
 
-    versao_modelo = MODELO_VISAO if fonte == 'ia' else 'ocr-tesseract'
+    versao_modelo = (dados_ia.get('modelo') or 'groq-visao') if fonte == 'ia' else 'ocr-tesseract'
     analise = AnaliseIA(
         num_prestacao=reembolso.num_prestacao,
         score_confiabilidade=score,

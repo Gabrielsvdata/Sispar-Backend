@@ -17,8 +17,8 @@ from datetime import date, datetime
 from PIL import Image
 
 from src.utils.arquivos import arquivo_temporario
+from src.utils.modelos_groq import MODELOS_VISAO, completar, escolher_modelo, sem_raciocinio
 
-MODELO_VISAO = os.getenv("GROQ_VISION_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct")
 LADO_MAXIMO_IMAGEM = 1600
 TOLERANCIA_VALOR_PERCENTUAL = 5.0
 DIAS_MAXIMOS_COMPROVANTE = 90
@@ -100,10 +100,13 @@ def extrair_dados_com_ia(conteudo: bytes, mime_type: str):
 
     try:
         data_url = _imagem_para_data_url(conteudo, mime_type)
-        parametros = dict(
-            model=MODELO_VISAO,
+        modelo = escolher_modelo(cliente, MODELOS_VISAO, "GROQ_VISION_MODEL")
+        resposta = completar(
+            cliente,
+            modelo,
             temperature=0,
             max_tokens=800,
+            response_format={"type": "json_object"},
             messages=[
                 {
                     "role": "user",
@@ -114,16 +117,10 @@ def extrair_dados_com_ia(conteudo: bytes, mime_type: str):
                 }
             ],
         )
-        try:
-            resposta = cliente.chat.completions.create(response_format={"type": "json_object"}, **parametros)
-        except Exception as erro:
-            # Alguns modelos de visão não aceitam o modo JSON; tenta de novo sem ele
-            if "response_format" not in str(erro) and "json" not in str(erro).lower():
-                raise
-            resposta = cliente.chat.completions.create(**parametros)
-        dados = _json_da_resposta(resposta.choices[0].message.content)
+        dados = _json_da_resposta(sem_raciocinio(resposta.choices[0].message.content))
         if not isinstance(dados, dict):
             return None, "Resposta da IA fora do formato esperado"
+        dados["modelo"] = modelo
         return dados, None
     except Exception as erro:  # rede, limite de uso, modelo indisponível, JSON inválido
         return None, f"{type(erro).__name__}: {erro}"

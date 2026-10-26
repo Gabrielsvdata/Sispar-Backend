@@ -5,13 +5,13 @@ import os
 from datetime import datetime
 from src.model.reembolso_model import Reembolso
 from src.model import db
+from src.utils.modelos_groq import MODELOS_TEXTO, completar, escolher_modelo, sem_raciocinio
 from functools import wraps
 
 bp_chatbot = Blueprint('chatbot', __name__, url_prefix='/chatbot')
 
 # Configurar cliente Groq
 # Nota: A biblioteca OpenAI é compatível com a API do Groq
-GROQ_CHAT_MODEL = os.getenv('GROQ_CHAT_MODEL', 'llama-3.3-70b-versatile')
 _client = None
 
 
@@ -297,8 +297,9 @@ def enviar_mensagem():
         })
         
         # Chamar API do Groq com timeout
-        completion = client.chat.completions.create(
-            model=GROQ_CHAT_MODEL,
+        completion = completar(
+            client,
+            escolher_modelo(client, MODELOS_TEXTO, 'GROQ_CHAT_MODEL'),
             messages=mensagens,
             temperature=0.7,
             max_tokens=1024,
@@ -308,7 +309,7 @@ def enviar_mensagem():
         )
         
         # Extrair resposta
-        resposta = completion.choices[0].message.content
+        resposta = sem_raciocinio(completion.choices[0].message.content)
         
         # Gerar sugestões de próximas perguntas
         sugestoes = [
@@ -342,6 +343,6 @@ def health_check():
     return jsonify({
         'status': 'ok',
         'service': 'chatbot',
-        'model': GROQ_CHAT_MODEL,
+        'model': os.getenv('GROQ_CHAT_MODEL') or 'automático (primeiro disponível)',
         'provider': 'Groq'
     }), 200
