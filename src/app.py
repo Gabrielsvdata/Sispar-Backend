@@ -15,6 +15,7 @@ ORIGENS_PADRAO = [
     "http://localhost:3000",
     "http://localhost:5000",
     "https://projeto-sispar.vercel.app",
+    "https://sispar.gabrielsilvanovieira7.workers.dev",
 ]
 
 # -----------------------
